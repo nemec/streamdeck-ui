@@ -1,6 +1,8 @@
 """Defines the QT powered interface for configuring Stream Decks"""
 import os
 import shlex
+import signal
+import socket
 import sys
 import time
 from functools import partial
@@ -9,7 +11,8 @@ from typing import Callable, Dict
 
 from pynput.keyboard import Controller, Key
 from PySide2 import QtWidgets
-from PySide2.QtCore import QMimeData, QSize, Qt, QTimer
+from PySide2.QtCore import QMimeData, QSize, Qt, QTimer, Signal
+from PySide2.QtNetwork import QAbstractSocket
 from PySide2.QtGui import QDrag, QIcon
 from PySide2.QtWidgets import (
     QAction,
@@ -626,6 +629,41 @@ def dim_all_displays() -> None:
         dimmer.dim(True)
 
 
+# https://stackoverflow.com/questions/4938723/what-is-the-correct-way-to-make-my-pyqt-application-quit-when-killed-from-the-co
+class SignalWakeupHandler(QAbstractSocket):
+
+    def __init__(self, parent=None):
+        super().__init__(QAbstractSocket.UdpSocket, parent)
+        self.old_fd = None
+        # Create a socket pair
+        self.wsock, self.rsock = socket.socketpair(type=socket.SOCK_DGRAM)
+        # Let Qt listen on the one end
+        self.setSocketDescriptor(self.rsock.fileno())
+        # And let Python write on the other end
+        self.wsock.setblocking(False)
+        self.old_fd = signal.set_wakeup_fd(self.wsock.fileno())
+        # First Python code executed gets any exception from
+        # the signal handler, so add a dummy handler first
+        self.readyRead.connect(lambda : None)
+        # Second handler does the real handling
+        self.readyRead.connect(self._readSignal)
+
+    def __del__(self):
+        # Restore any old handler on deletion
+        if self.old_fd is not None and signal and signal.set_wakeup_fd:
+            signal.set_wakeup_fd(self.old_fd)
+
+    def _readSignal(self):
+        # Read the written byte.
+        # Note: readyRead is blocked from occuring again until readData()
+        # was called, so call it, even if you don't need the value.
+        data = self.readData(1)
+        # Emit a Qt signal for convenience
+        self.signalReceived.emit(data[0])
+
+    signalReceived = Signal(int)
+
+
 def start(_exit: bool = False) -> None:
     show_ui = True
     if "-h" in sys.argv or "--help" in sys.argv:
@@ -638,6 +676,9 @@ def start(_exit: bool = False) -> None:
         show_ui = False
 
     app = QApplication(sys.argv)
+    SignalWakeupHandler(app)
+    for sig in [signal.SIGINT, signal.SIGTERM]:
+        signal.signal(sig, lambda sig, _: app.quit())
 
     logo = QIcon(LOGO)
     main_window = MainWindow()
