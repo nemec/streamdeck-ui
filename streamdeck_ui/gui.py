@@ -13,7 +13,7 @@ from pynput.keyboard import Controller, Key
 from PySide2 import QtWidgets
 from PySide2.QtCore import QMimeData, QSize, Qt, QTimer, Signal
 from PySide2.QtNetwork import QAbstractSocket
-from PySide2.QtGui import QDrag, QIcon
+from PySide2.QtGui import QDrag, QIcon, QScreen
 from PySide2.QtWidgets import (
     QAction,
     QApplication,
@@ -26,7 +26,7 @@ from PySide2.QtWidgets import (
     QSystemTrayIcon,
 )
 
-from streamdeck_ui import api
+from streamdeck_ui import api, websocket
 from streamdeck_ui.config import LOGO
 from streamdeck_ui.ui_main import Ui_MainWindow
 from streamdeck_ui.ui_settings import Ui_SettingsDialog
@@ -742,6 +742,11 @@ def start(_exit: bool = False) -> None:
     timer = QTimer()
     timer.timeout.connect(partial(sync, ui))
     timer.start(1000)
+
+    ws_server = websocket.start_server(9387, app)
+    ratio = app.devicePixelRatio()
+    plugin_server = websocket.PluginServer(ws_server, ratio, app)
+    api.streamdesk_keys.key_pressed.connect(plugin_server.handle_keypress)
 
     api.render()
     tray.show()
