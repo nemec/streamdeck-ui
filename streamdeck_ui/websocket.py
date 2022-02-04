@@ -15,7 +15,7 @@ from PySide2.QtCore import QObject, Signal
 import PySide2.QtNetwork
 from PySide2.QtWebSockets import QWebSocketServer, QWebSocket
 
-from streamdeck_ui import api, __version__
+from streamdeck_ui import api, gui, __version__
 from streamdeck_ui.config import CACHE_DIRECTORY
 
 class StreamDeckWsServer(QObject):
@@ -25,10 +25,10 @@ class StreamDeckWsServer(QObject):
 
     def __init__(self, port: int, parent=None) -> None:
         super().__init__(parent)
-        #self.host = PySide2.QtNetwork.QHostAddress.LocalHost
-        self.host = PySide2.QtNetwork.QHostAddress.AnyIPv4
+        self.host = PySide2.QtNetwork.QHostAddress.LocalHost
+        #self.host = PySide2.QtNetwork.QHostAddress.AnyIPv4
         self.port = port
-        self.clients = []
+        self.clients = set()
         self.server: QWebSocketServer = QWebSocketServer(
             parent.serverName(),
             parent.secureMode(),
@@ -37,9 +37,6 @@ class StreamDeckWsServer(QObject):
             print(f'Websocket Server Listening: ws://{self.server.serverAddress().toString()}:{self.server.serverPort()}')
         self.server.acceptError.connect(self.on_accept_error)
         self.server.newConnection.connect(self.on_new_connection)
-        self.client_connection = None
-
-        print(self.server.isListening())
 
 
     def on_accept_error(self, accept_error):
@@ -47,54 +44,51 @@ class StreamDeckWsServer(QObject):
 
 
     def on_new_connection(self):
-        self.client_connection = self.server.nextPendingConnection()
-        self.client_connection.textMessageReceived.connect(self.process_text_message)
-        #self.client_connection.textFrameReceived.connect(self.process_text_frame)
-        #self.client_connection.binaryMessageReceived.connect(self.process_binary_message)
-        self.client_connection.disconnected.connect(self.socket_disconnected)
+        client = self.server.nextPendingConnection()
+        
+        # Capture client object in a closure so that we can identify which
+        # client sent the message/disconnected in each callback
+        
+        client.textMessageReceived.connect(lambda message: self.process_text_message(client, message))
+        #self.client.textFrameReceived.connect(lambda frame, is_last_frame: self.process_text_frame(client, frame, is_last_frame))
+        #self.client.binaryMessageReceived.connect(lambda message: self.process_binary_message(client, message))
+        client.disconnected.connect(lambda: self.socket_disconnected(client))
 
-        print('New client')
-        self.clients.append(self.client_connection)
-        self.client_connected.emit(self.client_connection)
+        print(f'New client {client}')
+        self.clients.add(client)
+        self.client_connected.emit(client)
 
 
-    def process_text_message(self, message):
+    def process_text_message(self, client, message):
         print(f'm:{message}')
-        #if self.client_connection:
-        #    for client in self.clients:
-        #        client.sendTextMessage(message)
         try:
             message_dict = json.loads(message)
+            self.client_message_received.emit(client, message_dict)
         except Exception as e:
             print(f'Error parsing client message: {e}')
-            if self.client_connection:
-                self.client_connection.sendTextMessage(json.dumps({
-                    'event': 'error',
-                    'payload': {
-                        'message': str(e)
-                    }
-                }))
-            return
-        self.client_message_received.emit(self.client_connection, message_dict)
+            client.sendTextMessage(json.dumps({
+                'event': 'error',
+                'payload': {
+                    'message': str(e)
+                }
+            }))
 
 
-    def process_text_frame(self, frame, is_last_frame):
+    def process_text_frame(self, client, frame, is_last_frame):
         print(f'f:{frame}/{is_last_frame}')
 
 
-    def process_binary_message(self, message):
+    def process_binary_message(self, client, message):
         print(f'b:{message}')
         if self.client_connection:
             self.client_connection.sendBinaryMessage(message)
 
 
-    def socket_disconnected(self):
-        print('Socket disconnected')
-        if self.client_connection:
-            self.clients.remove(self.client_connection)
-            self.client_disconnected.emit(self.client_connection)
-            self.client_connection.deleteLater()
-            self.client_connection = None
+    def socket_disconnected(self, client):
+        print(f'Client {client} disconnected')
+        self.clients.remove(client)
+        self.client_disconnected.emit(client)
+        client.deleteLater()
 
 
 class PluginServer(QObject):
@@ -196,6 +190,7 @@ class PluginServer(QObject):
                 if page_num is not None and page_num >= 0 and device_id in api.decks:
                     api.set_page(device_id, page_num)
             elif event_name == 'setImage':
+                # TODO support http, https, mdi, fa - also support color for mdi, fa
                 # {'event': 'setImage', 'payload': {'device': 'device_id', 'page': 0, 'row': 0, 'column': 0, 'image': <base64 encoded image> }}
                 # "data:image/png;base64,iVBORw0KGgoA..."
                 # "data:image/jpg;base64,/9j/4AAQSkZJ..."
@@ -231,6 +226,36 @@ class PluginServer(QObject):
                 if text is None:
                     text = ''
                 api.set_button_text(device_id, page, key, text)
+            elif event_name == 'wakeScreen':
+                # {'event': 'wakeScreen', 'payload': {'device': 'device_id'}}
+                device_id = payload.get('device')
+                dimmer = gui.dimmers.get(device_id)
+                if dimmer is None:
+                    return
+                dimmer.reset()
+            elif event_name == 'dimScreen':
+                # {'event': 'dimScreen', 'payload': {'device': 'device_id'}}
+                device_id = payload.get('device')
+                dimmer = gui.dimmers.get(device_id)
+                if dimmer is None:
+                    return
+                dimmer.dim()
+            elif event_name == 'tempWakeScreen':
+                # {'event': 'tempWakeScreen', 'payload': {'device': 'device_id', 'timeoutSeconds': 10}}
+                device_id = payload.get('device')
+                timeout_seconds = payload.get('timeoutSeconds', 10)
+                dimmer = gui.dimmers.get(device_id)
+                if dimmer is None:
+                    return
+                if not dimmer._Dimmer__timer or dimmer._Dimmer__timer.isActive():
+                    return  # Screen already awake
+                print('setting temporary display timeout')
+                # Not really threadsafe, but OK
+                # TODO this logic should live inside the Dimmer class
+                timeout = dimmer.timeout
+                dimmer.timeout = timeout_seconds # temporarily set timeout
+                dimmer.reset()
+                dimmer.timeout = timeout
 
 
         except Exception as e:
